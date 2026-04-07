@@ -124,6 +124,16 @@ export function ChannelSettings(): React.ReactElement {
       return
     }
 
+    // 如果开启且当前没有选中渠道，自动选中
+    if (enabled && !agentChannelId) {
+      setAgentChannelId(channelId)
+      await window.electronAPI.updateSettings({
+        agentChannelIds: newIds,
+        agentChannelId: channelId,
+      }).catch(console.error)
+      return
+    }
+
     await window.electronAPI.updateSettings({ agentChannelIds: newIds }).catch(console.error)
   }
 
@@ -151,10 +161,8 @@ export function ChannelSettings(): React.ReactElement {
     )
   }
 
-  // Anthropic 渠道（已启用）
-  const anthropicChannels = channels.filter(
-    (c) => c.provider === 'anthropic' && c.enabled
-  )
+  // 所有已启用渠道（可用于 Agent 模式）
+  const enabledChannels = channels.filter((c) => c.enabled)
 
   // 列表视图
   return (
@@ -162,7 +170,7 @@ export function ChannelSettings(): React.ReactElement {
       {/* 区块一：模型配置 */}
       <SettingsSection
         title="模型配置"
-        description="管理 AI 供应商连接，配置 API Key 和可用模型。Anthropic 渠道同时可用于 Agent 模式"
+        description="管理 AI 供应商连接，配置 API Key 和可用模型"
         action={
           <Button size="sm" onClick={() => setViewMode('create')}>
             <Plus size={16} />
@@ -209,15 +217,15 @@ export function ChannelSettings(): React.ReactElement {
         </SettingsCard>
         {loading ? (
           <div className="text-sm text-muted-foreground py-8 text-center">加载中...</div>
-        ) : anthropicChannels.length === 0 ? (
+        ) : enabledChannels.length === 0 ? (
           <SettingsCard divided={false}>
             <div className="text-sm text-muted-foreground py-8 text-center">
-              暂无可用的 Anthropic 兼容格式渠道，请先在上方添加 Anthropic 渠道并启用
+              暂无已启用的渠道，请先在上方添加并启用渠道
             </div>
           </SettingsCard>
         ) : (
           <SettingsCard>
-            {anthropicChannels.map((channel) => (
+            {enabledChannels.map((channel) => (
               <AgentProviderRow
                 key={channel.id}
                 channel={channel}

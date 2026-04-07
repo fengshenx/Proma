@@ -21,10 +21,12 @@ import { existsSync, mkdirSync, symlinkSync, readFileSync, writeFileSync } from 
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { app } from 'electron'
-import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload } from '@proma/shared'
+import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, TypedError, RetryAttempt, SDKMessage, SDKAssistantMessage, AgentStreamPayload, ProviderType, AgentAdapterType } from '@proma/shared'
 import { SAFE_TOOLS } from '@proma/shared'
 import type { PermissionRequest, PromaPermissionMode, AskUserRequest, ExitPlanModeRequest } from '@proma/shared'
 import type { ClaudeAgentQueryOptions } from './adapters/claude-agent-adapter'
+import type { OpenAgentQueryOptions } from './adapters/open-agent-adapter'
+import { resolveApiType } from './adapters/open-agent-adapter'
 import { isPromptTooLongError, friendlyErrorMessage, mapSDKErrorToTypedError, extractErrorDetails } from './adapters/claude-agent-adapter'
 import { AgentEventBus } from './agent-event-bus'
 import { decryptApiKey, getChannelById, listChannels } from './channel-manager'
@@ -396,7 +398,7 @@ const DEFAULT_MODEL_ID = 'claude-sonnet-4-5-20250929'
 // ===== AgentOrchestrator =====
 
 export class AgentOrchestrator {
-  private adapter: AgentProviderAdapter
+  private getAdapter: (adapterType: AgentAdapterType) => AgentProviderAdapter
   private eventBus: AgentEventBus
   private activeSessions = new Map<string, number>()
 
@@ -409,8 +411,11 @@ export class AgentOrchestrator {
   /** 运行中会话的当前权限模式（支持运行时动态切换） */
   private sessionPermissionModes = new Map<string, PromaPermissionMode>()
 
-  constructor(adapter: AgentProviderAdapter, eventBus: AgentEventBus) {
-    this.adapter = adapter
+  /** 运行中会话使用的 adapter（按 sessionId 隔离，用于 stop/queueMessage 等操作） */
+  private sessionAdapters = new Map<string, AgentProviderAdapter>()
+
+  constructor(getAdapter: (adapterType: AgentAdapterType) => AgentProviderAdapter, eventBus: AgentEventBus) {
+    this.getAdapter = getAdapter
     this.eventBus = eventBus
   }
 
@@ -682,7 +687,7 @@ export class AgentOrchestrator {
    */
   private prepareSessionNotFoundRecovery(
     sessionId: string,
-    queryOptions: ClaudeAgentQueryOptions,
+    queryOptions: ClaudeAgentQueryOptions | OpenAgentQueryOptions,
     contextualMessage: string,
     agentCwd: string,
     accumulatedMessages: SDKMessage[],
@@ -690,7 +695,9 @@ export class AgentOrchestrator {
   ): string {
     console.log(`[Agent 编排] 检测到 session-not-found 错误，清除 sdkSessionId 并切换到上下文回填模式`)
     try { updateAgentSessionMeta(sessionId, { sdkSessionId: undefined }) } catch { /* 忽略 */ }
-    queryOptions.resumeSessionId = undefined
+    if ('resumeSessionId' in queryOptions) {
+      (queryOptions as ClaudeAgentQueryOptions).resumeSessionId = undefined
+    }
     queryOptions.prompt = buildContextPrompt(sessionId, contextualMessage, { agentCwd })
     this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
     accumulatedMessages.length = 0
@@ -790,19 +797,27 @@ export class AgentOrchestrator {
       return
     }
 
-    // 3. 构建环境变量
+    // 2.5 选择 Agent 适配器并注册到会话
+    const adapterType: AgentAdapterType = channel.agentAdapterType ?? (channel.provider === 'anthropic' ? 'claude-sdk' : 'open-agent-sdk')
+    const isClaudeSdk = adapterType === 'claude-sdk'
+    const adapter = this.getAdapter(adapterType)
+    this.sessionAdapters.set(sessionId, adapter)
+
+    // 3. 构建环境变量（仅 Claude SDK 需要）
     // 同步凭证到 process.env（SDK in-process 代码可能直接读取 process.env）
     // 先清理再注入，确保 SDK 无论从 env 选项还是 process.env 都拿到正确值
-    delete process.env.ANTHROPIC_API_KEY
-    delete process.env.ANTHROPIC_AUTH_TOKEN
-    delete process.env.ANTHROPIC_BASE_URL
-    process.env.ANTHROPIC_API_KEY = apiKey
-    // 使用与 buildSdkEnv 相同的规范化逻辑，确保 process.env 和 sdkEnv 中的 URL 一致
-    if (channel.baseUrl && channel.baseUrl !== 'https://api.anthropic.com') {
-      process.env.ANTHROPIC_BASE_URL = normalizeAnthropicBaseUrlForSdk(channel.baseUrl)
+    let sdkEnv: Record<string, string | undefined> = {}
+    if (isClaudeSdk) {
+      delete process.env.ANTHROPIC_API_KEY
+      delete process.env.ANTHROPIC_AUTH_TOKEN
+      delete process.env.ANTHROPIC_BASE_URL
+      process.env.ANTHROPIC_API_KEY = apiKey
+      // 使用与 buildSdkEnv 相同的规范化逻辑，确保 process.env 和 sdkEnv 中的 URL 一致
+      if (channel.baseUrl && channel.baseUrl !== 'https://api.anthropic.com') {
+        process.env.ANTHROPIC_BASE_URL = normalizeAnthropicBaseUrlForSdk(channel.baseUrl)
+      }
+      sdkEnv = await this.buildSdkEnv(apiKey, channel.baseUrl)
     }
-
-    const sdkEnv = await this.buildSdkEnv(apiKey, channel.baseUrl)
 
     // 4. 读取已有的 SDK session ID（用于 resume）
     const sessionMeta = getAgentSessionMeta(sessionId)
@@ -853,28 +868,36 @@ export class AgentOrchestrator {
     let workspace: import('@proma/shared').AgentWorkspace | undefined
 
     try {
-      // 8. 动态导入 SDK
-      const sdk = await import('@anthropic-ai/claude-agent-sdk')
-
-      // 9. 构建 SDK query
-      const cliPath = resolveSDKCliPath()
-      agentExec = getAgentExecutable()
-
-      if (!existsSync(cliPath)) {
-        const errMsg = `SDK CLI 文件不存在: ${cliPath}`
-        console.error(`[Agent 编排] ${errMsg}`)
-        callbacks.onError(errMsg)
-        return
-      }
-
-      ensureRipgrepAvailable(cliPath)
-
-      console.log(
-        `[Agent 编排] 启动 SDK — CLI: ${cliPath}, 运行时: ${agentExec.type} (${agentExec.path}), 模型: ${modelId || DEFAULT_MODEL_ID}, resume: ${existingSdkSessionId ?? '无'}`,
-      )
-
+      // 8. Claude SDK 特有初始化（仅 Anthropic 渠道）
+      let sdk: typeof import('@anthropic-ai/claude-agent-sdk') | undefined
+      let cliPath = ''
       const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null'
-      const executableArgs = agentExec.type === 'bun' ? [`--env-file=${nullDevice}`] : []
+      let executableArgs: string[] = []
+
+      if (isClaudeSdk) {
+        sdk = await import('@anthropic-ai/claude-agent-sdk')
+        cliPath = resolveSDKCliPath()
+        agentExec = getAgentExecutable()
+
+        if (!existsSync(cliPath)) {
+          const errMsg = `SDK CLI 文件不存在: ${cliPath}`
+          console.error(`[Agent 编排] ${errMsg}`)
+          callbacks.onError(errMsg)
+          return
+        }
+
+        ensureRipgrepAvailable(cliPath)
+
+        console.log(
+          `[Agent 编排] 启动 SDK — CLI: ${cliPath}, 运行时: ${agentExec.type} (${agentExec.path}), 模型: ${modelId || DEFAULT_MODEL_ID}, resume: ${existingSdkSessionId ?? '无'}`,
+        )
+
+        executableArgs = agentExec.type === 'bun' ? [`--env-file=${nullDevice}`] : []
+      } else {
+        console.log(
+          `[Agent 编排] 启动 OAS — Provider: ${channel.provider}, 模型: ${modelId || DEFAULT_MODEL_ID}, baseURL: ${channel.baseUrl}`,
+        )
+      }
 
       // 确定 Agent 工作目录
       agentCwd = homedir()
@@ -932,8 +955,11 @@ export class AgentOrchestrator {
 
       // 10. 构建 MCP 服务器配置 + 记忆工具 + 生图工具 + 自定义工具
       const mcpServers = this.buildMcpServers(workspaceSlug)
-      await this.injectMemoryTools(sdk, mcpServers)
-      await this.injectNanoBananaTools(sdk, mcpServers, sessionId, agentCwd)
+      // 内置 MCP 工具注入（依赖 claude-agent-sdk 的 createSdkMcpServer，仅 Anthropic 渠道可用）
+      if (isClaudeSdk && sdk) {
+        await this.injectMemoryTools(sdk, mcpServers)
+        await this.injectNanoBananaTools(sdk, mcpServers, sessionId, agentCwd)
+      }
 
       // 合并外部注入的自定义 MCP 服务器（如飞书群聊工具）
       if (customMcpServers) {
@@ -1052,8 +1078,8 @@ export class AgentOrchestrator {
             this.sessionPermissionModes.set(sessionId, result.targetMode)
             planModeEntered = false
             // 同步通知 SDK 侧切换权限模式
-            if (this.adapter.setPermissionMode) {
-              this.adapter.setPermissionMode(sessionId, result.targetMode).catch((err: unknown) => {
+            if (this.sessionAdapters.get(sessionId)?.setPermissionMode) {
+              this.sessionAdapters.get(sessionId)!.setPermissionMode!(sessionId, result.targetMode).catch((err: unknown) => {
                 console.warn(`[Agent 编排] SDK 权限模式切换失败:`, err)
               })
             }
@@ -1106,98 +1132,132 @@ export class AgentOrchestrator {
       const maxTurns = appSettings.agentMaxTurns && appSettings.agentMaxTurns > 0
         ? appSettings.agentMaxTurns
         : undefined
-      const queryOptions: ClaudeAgentQueryOptions = {
-        sessionId,
-        prompt: finalPrompt,
-        model: modelId || DEFAULT_MODEL_ID,
-        cwd: agentCwd,
-        sdkCliPath: cliPath,
-        executable: agentExec,
-        executableArgs,
-        env: sdkEnv,
-        ...(maxTurns != null && { maxTurns }),
-        sdkPermissionMode: initialPermissionMode,
-        // 始终为 true：Worker 子代理使用 SDK 内部 mailbox 通信，
-        // 若不跳过权限检查会导致 Worker 阻塞超时并提前停止
-        allowDangerouslySkipPermissions: true,
-        canUseTool,
-        ...(initialPermissionMode === 'acceptEdits' && { allowedTools: [...SAFE_TOOLS] }),
-        systemPrompt: {
-          type: 'preset',
-          preset: 'claude_code',
-          append: buildSystemPrompt({
+
+      // 共享回调
+      const onSessionId = (sdkSessionId: string) => {
+        capturedSdkSessionId = sdkSessionId
+        if (sdkSessionId !== existingSdkSessionId) {
+          try {
+            updateAgentSessionMeta(sessionId, { sdkSessionId })
+            console.log(`[Agent 编排] 已保存 SDK session_id: ${sdkSessionId}`)
+            const verifyMeta = getAgentSessionMeta(sessionId)
+            console.log(`[Agent 编排] 验证读回: sdkSessionId=${verifyMeta?.sdkSessionId || '空'}`)
+          } catch (err) {
+            console.error(`[Agent 编排] 保存 SDK session_id 失败:`, err)
+          }
+        }
+
+        // SDK 初始化完成后立即触发标题生成，使多会话并发时用户能快速区分
+        if (!titleGenerationStarted) {
+          titleGenerationStarted = true
+          this.autoGenerateTitle(sessionId, userMessage, channelId, resolvedModel, callbacks)
+            .catch((err) => console.error('[Agent 编排] 标题生成未捕获异常:', err))
+        }
+      }
+      const onModelResolved = (model: string) => {
+        resolvedModel = model
+        console.log(`[Agent 编排] SDK 确认模型: ${resolvedModel}`)
+        this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'model_resolved', model } })
+      }
+      const onContextWindow = (cw: number) => {
+        console.log(`[Agent 编排] 缓存 contextWindow: ${cw}`)
+      }
+
+      // 附加目录（两种 adapter 共用）
+      const allDirs = [...(additionalDirectories || [])]
+      if (workspaceSlug) {
+        const workspaceDirs = getWorkspaceAttachedDirectories(workspaceSlug)
+        for (const dir of workspaceDirs) {
+          if (!allDirs.includes(dir)) allDirs.push(dir)
+        }
+        const wsFilesDir = getWorkspaceFilesDir(workspaceSlug)
+        if (!allDirs.includes(wsFilesDir)) {
+          allDirs.push(wsFilesDir)
+        }
+      }
+
+      // 根据 Provider 类型构建不同的查询选项
+      let queryOptions: ClaudeAgentQueryOptions | OpenAgentQueryOptions
+
+      if (isClaudeSdk) {
+        // Anthropic 渠道 → ClaudeAgentAdapter
+        queryOptions = {
+          sessionId,
+          prompt: finalPrompt,
+          model: modelId || DEFAULT_MODEL_ID,
+          cwd: agentCwd,
+          sdkCliPath: cliPath,
+          executable: agentExec,
+          executableArgs,
+          env: sdkEnv,
+          ...(maxTurns != null && { maxTurns }),
+          sdkPermissionMode: initialPermissionMode,
+          allowDangerouslySkipPermissions: true,
+          canUseTool,
+          ...(initialPermissionMode === 'acceptEdits' && { allowedTools: [...SAFE_TOOLS] }),
+          systemPrompt: {
+            type: 'preset',
+            preset: 'claude_code',
+            append: buildSystemPrompt({
+              workspaceName: workspace?.name,
+              workspaceSlug,
+              sessionId,
+              permissionMode: initialPermissionMode,
+              memoryEnabled: (() => { const mc = getMemoryConfig(); return mc.enabled && !!mc.apiKey })(),
+            }),
+          },
+          resumeSessionId: existingSdkSessionId,
+          ...(isForkResume && { forkSession: true }),
+          ...(isForkResume && forkResumeSessionAt && { resumeSessionAt: forkResumeSessionAt }),
+          ...(Object.keys(mcpServers).length > 0 && { mcpServers }),
+          ...(workspaceSlug && { plugins: [{ type: 'local' as const, path: getAgentWorkspacePath(workspaceSlug) }] }),
+          ...(allDirs.length > 0 && { additionalDirectories: allDirs }),
+          ...(appSettings.agentThinking && { thinking: appSettings.agentThinking }),
+          ...(appSettings.agentEffort && { effort: appSettings.agentEffort }),
+          ...(appSettings.agentMaxBudgetUsd != null && appSettings.agentMaxBudgetUsd > 0 && {
+            maxBudgetUsd: appSettings.agentMaxBudgetUsd,
+          }),
+          agents: buildBuiltinAgents(),
+          onStderr: (data: string) => {
+            stderrChunks.push(data)
+            console.error(`[Agent SDK stderr] ${data}`)
+          },
+          onSessionId,
+          onModelResolved,
+          onContextWindow,
+        } as ClaudeAgentQueryOptions
+      } else {
+        // 非 Anthropic 渠道 → OpenAgentAdapter
+        queryOptions = {
+          sessionId,
+          prompt: finalPrompt,
+          model: modelId || DEFAULT_MODEL_ID,
+          cwd: agentCwd,
+          apiKey,
+          baseURL: channel.baseUrl,
+          apiType: resolveApiType(channel.provider, channel.baseUrl),
+          systemPrompt: buildSystemPrompt({
             workspaceName: workspace?.name,
             workspaceSlug,
             sessionId,
             permissionMode: initialPermissionMode,
             memoryEnabled: (() => { const mc = getMemoryConfig(); return mc.enabled && !!mc.apiKey })(),
           }),
-        },
-        resumeSessionId: existingSdkSessionId,
-        // 延迟 fork：首次发消息时让 SDK 在当前 cwd 的项目空间创建分叉 session
-        ...(isForkResume && { forkSession: true }),
-        ...(isForkResume && forkResumeSessionAt && { resumeSessionAt: forkResumeSessionAt }),
-        ...(Object.keys(mcpServers).length > 0 && { mcpServers }),
-        ...(workspaceSlug && { plugins: [{ type: 'local' as const, path: getAgentWorkspacePath(workspaceSlug) }] }),
-        // 合并用户附加目录 + 工作区附加目录 + 工作区文件目录
-        ...(() => {
-          const allDirs = [...(additionalDirectories || [])]
-          if (workspaceSlug) {
-            // 工作区级附加目录
-            const workspaceDirs = getWorkspaceAttachedDirectories(workspaceSlug)
-            for (const dir of workspaceDirs) {
-              if (!allDirs.includes(dir)) allDirs.push(dir)
-            }
-            // 工作区文件目录
-            const wsFilesDir = getWorkspaceFilesDir(workspaceSlug)
-            if (!allDirs.includes(wsFilesDir)) {
-              allDirs.push(wsFilesDir)
-            }
-          }
-          return allDirs.length > 0 ? { additionalDirectories: allDirs } : {}
-        })(),
-        // SDK 0.2.52+ 新增选项（从 settings 读取）
-        ...(appSettings.agentThinking && { thinking: appSettings.agentThinking }),
-        ...(appSettings.agentEffort && { effort: appSettings.agentEffort }),
-        ...(appSettings.agentMaxBudgetUsd != null && appSettings.agentMaxBudgetUsd > 0 && {
-          maxBudgetUsd: appSettings.agentMaxBudgetUsd,
-        }),
-        // 内置 SubAgent 定义（code-reviewer / explorer / researcher）
-        agents: buildBuiltinAgents(),
-        onStderr: (data: string) => {
-          stderrChunks.push(data)
-          console.error(`[Agent SDK stderr] ${data}`)
-        },
-        onSessionId: (sdkSessionId: string) => {
-          capturedSdkSessionId = sdkSessionId
-          if (sdkSessionId !== existingSdkSessionId) {
-            try {
-              updateAgentSessionMeta(sessionId, { sdkSessionId })
-              console.log(`[Agent 编排] 已保存 SDK session_id: ${sdkSessionId}`)
-              // 验证保存是否成功
-              const verifyMeta = getAgentSessionMeta(sessionId)
-              console.log(`[Agent 编排] 验证读回: sdkSessionId=${verifyMeta?.sdkSessionId || '空'}`)
-            } catch (err) {
-              console.error(`[Agent 编排] 保存 SDK session_id 失败:`, err)
-            }
-          }
-
-          // SDK 初始化完成后立即触发标题生成，使多会话并发时用户能快速区分
-          if (!titleGenerationStarted) {
-            titleGenerationStarted = true
-            this.autoGenerateTitle(sessionId, userMessage, channelId, resolvedModel, callbacks)
-              .catch((err) => console.error('[Agent 编排] 标题生成未捕获异常:', err))
-          }
-        },
-        onModelResolved: (model: string) => {
-          resolvedModel = model
-          console.log(`[Agent 编排] SDK 确认模型: ${resolvedModel}`)
-          // 通知渲染进程更新流式状态中的模型信息
-          this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'model_resolved', model } })
-        },
-        onContextWindow: (cw: number) => {
-          console.log(`[Agent 编排] 缓存 contextWindow: ${cw}`)
-        },
+          permissionMode: initialPermissionMode === 'bypassPermissions' ? 'bypassPermissions' : 'acceptEdits',
+          ...(initialPermissionMode === 'acceptEdits' && { allowedTools: [...SAFE_TOOLS] }),
+          ...(maxTurns != null && { maxTurns }),
+          ...(Object.keys(mcpServers).length > 0 && { mcpServers }),
+          ...(allDirs.length > 0 && { additionalDirectories: allDirs }),
+          ...(appSettings.agentThinking && { thinking: appSettings.agentThinking }),
+          ...(appSettings.agentEffort && { effort: appSettings.agentEffort }),
+          ...(appSettings.agentMaxBudgetUsd != null && appSettings.agentMaxBudgetUsd > 0 && {
+            maxBudgetUsd: appSettings.agentMaxBudgetUsd,
+          }),
+          agents: buildBuiltinAgents(),
+          onSessionId,
+          onModelResolved,
+          onContextWindow,
+        } as OpenAgentQueryOptions
       }
 
       console.log(`[Agent 编排] 开始通过 Adapter 遍历事件流...`)
@@ -1254,7 +1314,7 @@ export class AgentOrchestrator {
 
         try {
           // 获取异步迭代器（手动 .next() 以支持 Promise.race 中断）
-          const queryIterable = this.adapter.query(queryOptions)
+          const queryIterable = this.sessionAdapters.get(sessionId)!.query(queryOptions)
           const queryIterator = queryIterable[Symbol.asyncIterator]()
 
           // Watchdog 控制器（用于死锁检测后中断事件循环）
@@ -1541,13 +1601,13 @@ export class AgentOrchestrator {
               const resumeMessages: SDKMessage[] = []
 
               try {
-                const resumeOptions: ClaudeAgentQueryOptions = {
+                const resumeOptions = {
                   ...queryOptions,
                   prompt: resumePrompt,
-                  resumeSessionId: capturedSdkSessionId,
+                  ...('resumeSessionId' in queryOptions ? { resumeSessionId: capturedSdkSessionId } : {}),
                 }
 
-                for await (const resumeMsg of this.adapter.query(resumeOptions)) {
+                for await (const resumeMsg of this.sessionAdapters.get(sessionId)!.query(resumeOptions)) {
                   if (!this.activeSessions.has(sessionId)) break
 
                   // 跳过 replay 消息，仅累积新产生的消息
@@ -1749,6 +1809,7 @@ export class AgentOrchestrator {
         this.activeSessions.delete(sessionId)
         this.sessionPermissionModes.delete(sessionId)
         this.queuedMessageUuids.delete(sessionId)
+        this.sessionAdapters.delete(sessionId)
       }
       permissionService.clearSessionPending(sessionId)
       askUserService.clearSessionPending(sessionId)
@@ -1767,7 +1828,11 @@ export class AgentOrchestrator {
     this.sessionPermissionModes.delete(sessionId)
     this.stoppedBySessions.add(sessionId)
     this.queuedMessageUuids.delete(sessionId)
-    this.adapter.abort(sessionId)
+    const adapter = this.sessionAdapters.get(sessionId)
+    if (adapter) {
+      adapter.abort(sessionId)
+      this.sessionAdapters.delete(sessionId)
+    }
     console.log(`[Agent 编排] 已中止会话: ${sessionId}`)
   }
 
@@ -1786,8 +1851,9 @@ export class AgentOrchestrator {
     if (!this.activeSessions.has(sessionId)) return
     this.sessionPermissionModes.set(sessionId, mode)
     // 同步通知 SDK 侧
-    if (this.adapter.setPermissionMode) {
-      await this.adapter.setPermissionMode(sessionId, mode)
+    const adapter = this.sessionAdapters.get(sessionId)
+    if (adapter?.setPermissionMode) {
+      await adapter.setPermissionMode(sessionId, mode)
     }
     console.log(`[Agent 编排] 运行中权限模式已切换: sessionId=${sessionId}, mode=${mode}`)
   }
@@ -1796,7 +1862,10 @@ export class AgentOrchestrator {
   stopAll(): void {
     if (this.activeSessions.size === 0) return
     console.log(`[Agent 编排] 正在中止所有活跃会话 (${this.activeSessions.size} 个)...`)
-    this.adapter.dispose()
+    for (const [sid, adapter] of this.sessionAdapters) {
+      adapter.abort(sid)
+    }
+    this.sessionAdapters.clear()
     this.activeSessions.clear()
     this.sessionPermissionModes.clear()
     this.queuedMessageUuids.clear()
@@ -1822,7 +1891,8 @@ export class AgentOrchestrator {
       throw new Error(`[Agent 编排] 会话未运行，无法追加消息: ${sessionId}`)
     }
 
-    if (!this.adapter.sendQueuedMessage) {
+    const adapter = this.sessionAdapters.get(sessionId)
+    if (!adapter?.sendQueuedMessage) {
       throw new Error('[Agent 编排] 当前适配器不支持流式追加消息')
     }
 
@@ -1844,7 +1914,7 @@ export class AgentOrchestrator {
     }
 
     try {
-      await this.adapter.sendQueuedMessage(sessionId, sdkMessage)
+      await adapter.sendQueuedMessage(sessionId, sdkMessage)
       console.log(`[Agent 编排] 追加消息已注入: sessionId=${sessionId}, uuid=${uuid}`)
 
       // 立即持久化到 JSONL

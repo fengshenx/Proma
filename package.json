@@ -6,7 +6,8 @@
   "private": true,
   "workspaces": [
     "packages/*",
-    "apps/*"
+    "apps/*",
+    "open-agent-sdk-typescript"
   ],
   "scripts": {
     "dev": "bun run --filter='@proma/electron' dev",

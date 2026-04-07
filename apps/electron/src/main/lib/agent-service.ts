@@ -26,7 +26,7 @@ import type {
   AgentQueueMessageInput,
   PromaPermissionMode,
 } from '@proma/shared'
-import { ClaudeAgentAdapter } from './adapters/claude-agent-adapter'
+import { getAgentAdapter } from './adapters/index'
 import { AgentEventBus } from './agent-event-bus'
 import { AgentOrchestrator } from './agent-orchestrator'
 import { getAgentSessionWorkspacePath, getWorkspaceFilesDir } from './config-paths'
@@ -34,8 +34,7 @@ import { getAgentSessionWorkspacePath, getWorkspaceFilesDir } from './config-pat
 // ===== 实例创建 =====
 
 const eventBus = new AgentEventBus()
-const adapter = new ClaudeAgentAdapter()
-const orchestrator = new AgentOrchestrator(adapter, eventBus)
+const orchestrator = new AgentOrchestrator(getAgentAdapter, eventBus)
 
 /** 导出 EventBus 供飞书 Bridge 等外部服务订阅事件 */
 export { eventBus as agentEventBus }

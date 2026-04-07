@@ -38,6 +38,7 @@ import type {
   ChannelTestResult,
   FetchModelsResult,
   ProviderType,
+  AgentAdapterType,
 } from '@proma/shared'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
@@ -98,6 +99,17 @@ function buildPreviewUrl(baseUrl: string, provider: ProviderType): string {
   return `${trimmed}${PROVIDER_CHAT_PATHS[provider]}`
 }
 
+/** Agent 适配器选项 */
+const ADAPTER_SELECT_OPTIONS = [
+  { value: 'claude-sdk', label: 'Claude SDK' },
+  { value: 'open-agent-sdk', label: 'Open Agent SDK' },
+]
+
+/** 根据 provider 推断默认 adapter 类型 */
+function defaultAdapterType(provider: ProviderType): AgentAdapterType {
+  return provider === 'anthropic' ? 'claude-sdk' : 'open-agent-sdk'
+}
+
 /** auto-save 防抖延迟 */
 const AUTO_SAVE_DELAY = 600
 
@@ -107,6 +119,9 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   // 表单状态
   const [name, setName] = React.useState(channel?.name ?? '')
   const [provider, setProvider] = React.useState<ProviderType>(channel?.provider ?? 'anthropic')
+  const [agentAdapter, setAgentAdapter] = React.useState<AgentAdapterType>(
+    channel?.agentAdapterType ?? defaultAdapterType(channel?.provider ?? 'anthropic')
+  )
   const [baseUrl, setBaseUrl] = React.useState(channel?.baseUrl ?? PROVIDER_DEFAULT_URLS.anthropic)
   const [apiKey, setApiKey] = React.useState('')
   const [showApiKey, setShowApiKey] = React.useState(false)
@@ -156,6 +171,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     currentBaseUrl: string,
     currentApiKey: string,
     currentEnabled: boolean,
+    currentAgentAdapter?: AgentAdapterType,
   ) => {
     if (!isEdit || !channel) return
     setAutoSaveStatus('saving')
@@ -167,6 +183,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         apiKey: currentApiKey || undefined,
         models: currentModels,
         enabled: currentEnabled,
+        agentAdapterType: currentAgentAdapter,
       })
       setAutoSaveStatus('saved')
       setTimeout(() => setAutoSaveStatus('idle'), 1500)
@@ -184,11 +201,12 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     nextBaseUrl: string,
     nextApiKey: string,
     nextEnabled: boolean,
+    nextAgentAdapter?: AgentAdapterType,
   ) => {
     if (!isEdit || !initializedRef.current) return
     if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current)
     autoSaveTimerRef.current = setTimeout(() => {
-      doAutoSave(nextModels, nextName, nextProvider, nextBaseUrl, nextApiKey, nextEnabled)
+      doAutoSave(nextModels, nextName, nextProvider, nextBaseUrl, nextApiKey, nextEnabled, nextAgentAdapter)
     }, AUTO_SAVE_DELAY)
   }, [isEdit, doAutoSave])
 
@@ -206,15 +224,16 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
 
   // 监听字段变化触发 auto-save
   React.useEffect(() => {
-    scheduleAutoSave(models, name, provider, baseUrl, apiKey, enabled)
+    scheduleAutoSave(models, name, provider, baseUrl, apiKey, enabled, agentAdapter)
     return () => { if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current) }
-  }, [models, name, provider, baseUrl, apiKey, enabled, scheduleAutoSave])
+  }, [models, name, provider, baseUrl, apiKey, enabled, agentAdapter, scheduleAutoSave])
 
   // 切换供应商时自动更新 Base URL
   const handleProviderChange = (newProvider: string): void => {
     const p = newProvider as ProviderType
     setProvider(p)
     setBaseUrl(PROVIDER_DEFAULT_URLS[p])
+    setAgentAdapter(defaultAdapterType(p))
     setTestResult(null)
   }
 
@@ -312,6 +331,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         apiKey,
         models,
         enabled,
+        agentAdapterType: agentAdapter,
       }
       await window.electronAPI.createChannel(input)
       onSaved()
@@ -385,6 +405,13 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
             onValueChange={handleProviderChange}
             options={PROVIDER_SELECT_OPTIONS}
             placeholder="选择供应商"
+          />
+          <SettingsSelect
+            label="Agent 适配器"
+            description="Claude SDK 需要 Anthropic 兼容 API，Open Agent SDK 支持所有 OpenAI 兼容 API"
+            value={agentAdapter}
+            onValueChange={(v) => setAgentAdapter(v as AgentAdapterType)}
+            options={ADAPTER_SELECT_OPTIONS}
           />
           <SettingsInput
             label="Base URL"

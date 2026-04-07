@@ -6,6 +6,14 @@
  */
 
 /**
+ * Agent 适配器类型
+ *
+ * - claude-sdk: 基于 @anthropic-ai/claude-agent-sdk，子进程模式，需要 Anthropic 兼容 API
+ * - open-agent-sdk: 基于 @codeany/open-agent-sdk，in-process 模式，支持所有 OpenAI 兼容 API
+ */
+export type AgentAdapterType = 'claude-sdk' | 'open-agent-sdk'
+
+/**
  * 支持的 AI 供应商类型
  */
 export type ProviderType =
@@ -84,6 +92,8 @@ export interface Channel {
   models: ChannelModel[]
   /** 是否启用 */
   enabled: boolean
+  /** Agent 适配器类型（未设置时按 provider 自动推断） */
+  agentAdapterType?: AgentAdapterType
   /** 创建时间戳 */
   createdAt: number
   /** 更新时间戳 */
@@ -101,6 +111,8 @@ export interface ChannelCreateInput {
   apiKey: string
   models: ChannelModel[]
   enabled: boolean
+  /** Agent 适配器类型 */
+  agentAdapterType?: AgentAdapterType
 }
 
 /**
@@ -114,6 +126,8 @@ export interface ChannelUpdateInput {
   apiKey?: string
   models?: ChannelModel[]
   enabled?: boolean
+  /** Agent 适配器类型 */
+  agentAdapterType?: AgentAdapterType
 }
 
 /**
